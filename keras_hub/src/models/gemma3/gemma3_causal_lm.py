@@ -9,6 +9,9 @@ from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
 )
 from keras_hub.src.utils.tensor_utils import any_equal
 
+# Target number of tokens (across the batch) per chunk of a chunked prefill.
+PREFILL_CHUNK_TOKENS = 2048
+
 try:
     import tensorflow as tf
 except ImportError:
@@ -231,6 +234,11 @@ class Gemma3CausalLM(CausalLM):
             for _ in range(num_layers)
         )
         # Seed the cache.
+        chunk_size = self._prefill_chunk_size(token_ids)
+        if img_embeddings is None and chunk_size is not None:
+            return self._prefill_in_chunks(
+                token_ids, padding_mask, cache, chunk_size
+            )
         logits, hidden_states, cache = self.call_with_cache(
             token_ids=token_ids,
             img_embeddings=img_embeddings,
@@ -240,6 +248,64 @@ class Gemma3CausalLM(CausalLM):
             padding_mask=padding_mask,
             vision_indices=vision_indices,
             cache_update_mask=None,
+        )
+        return hidden_states, cache
+
+    def _prefill_chunk_size(self, token_ids):
+        """Chunk length for `_prefill_in_chunks`, or `None` for one pass.
+
+        Chunks hold about `PREFILL_CHUNK_TOKENS` tokens across the batch, so
+        each chunk is still a large matmul. Small batches and short sequences
+        fit in one chunk and keep the single-pass prefill.
+        """
+        batch_size, max_length = token_ids.shape
+        if batch_size is None or max_length is None:
+            return None
+        chunk_size = max(64, PREFILL_CHUNK_TOKENS // batch_size)
+        return chunk_size if chunk_size < max_length else None
+
+    def _prefill_in_chunks(self, token_ids, padding_mask, cache, chunk_size):
+        """Seed the cache in fixed-size chunks, up to the longest prompt.
+
+        Inputs are padded to the full generation length, so a single-pass
+        prefill also runs the model over every position that generation will
+        later fill. Here a loop with a data-dependent trip count stops at the
+        end of the longest prompt.
+
+        Prompts are right-padded, so the causal mask alone keeps every prompt
+        token from attending to padding. Positions past a prompt get
+        placeholder cache entries, which generation overwrites before they are
+        attended to.
+        """
+        batch_size, max_length = token_ids.shape
+        row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
+        num_chunks = (ops.max(row_lengths) + chunk_size - 1) // chunk_size
+        hidden_states = ops.zeros(
+            (batch_size, max_length, self.backbone.hidden_dim),
+            dtype=self.compute_dtype,
+        )
+
+        def cond(i, hidden_states, cache):
+            return i < num_chunks
+
+        def body(i, hidden_states, cache):
+            # Keep the last chunk inside the sequence. It may then recompute
+            # some positions, which writes the same cache values again.
+            start = ops.minimum(i * chunk_size, max_length - chunk_size)
+            chunk = ops.slice(token_ids, [0, start], [batch_size, chunk_size])
+            _, chunk_hidden_states, cache = self.call_with_cache(
+                token_ids=chunk,
+                cache=cache,
+                cache_update_index=start,
+            )
+            hidden_states = ops.slice_update(
+                hidden_states, [0, start, 0], chunk_hidden_states
+            )
+            return i + 1, hidden_states, cache
+
+        i = ops.convert_to_tensor(0, "int32")
+        _, hidden_states, cache = ops.while_loop(
+            cond, body, (i, hidden_states, cache)
         )
         return hidden_states, cache
 
