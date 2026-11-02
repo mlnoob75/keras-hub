@@ -146,9 +146,11 @@ class Gemma3CausalLM(CausalLM):
         Args:
             token_ids: a dense int Tensor with shape `(batch_size, max_length)`.
             cache: a tuple of per-layer caches, one entry per transformer
-                layer. Each entry is a `(key, value)` tuple, where `key` and
-                `value` are dense float Tensors with shape
-                `(batch_size, max_length, num_key_value_heads, head_dim)`.
+                layer. Each entry is a `(key, value)` tuple of dense float
+                Tensors. `key` has shape
+                `(batch_size, max_length, num_key_value_heads, head_dim)` and
+                `value` has shape
+                `(batch_size, num_key_value_heads, head_dim, max_length)`.
             cache_update_index: int, or int Tensor. The index of current inputs
                 in the whole sequence.
             img_embeddings: a dense float Tensor with shape
@@ -217,12 +219,14 @@ class Gemma3CausalLM(CausalLM):
         num_layers = self.backbone.num_layers
         num_heads = self.backbone.num_key_value_heads
         head_dim = self.backbone.head_dim
-        # Allocate per-layer (key, value) caches as a tuple.
-        layer_shape = [batch_size, max_length, num_heads, head_dim]
+        # Allocate per-layer (key, value) caches as a tuple. Values are stored
+        # sequence-last; see `CachedGemma3Attention.call`.
+        key_shape = [batch_size, max_length, num_heads, head_dim]
+        value_shape = [batch_size, num_heads, head_dim, max_length]
         cache = tuple(
             (
-                ops.zeros(layer_shape, dtype=self.compute_dtype),
-                ops.zeros(layer_shape, dtype=self.compute_dtype),
+                ops.zeros(key_shape, dtype=self.compute_dtype),
+                ops.zeros(value_shape, dtype=self.compute_dtype),
             )
             for _ in range(num_layers)
         )

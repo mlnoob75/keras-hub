@@ -230,7 +230,13 @@ class CachedGemma3Attention(keras.layers.Layer):
         attention_mask,
         training=False,
         cache_update_index=0,
+        value_is_transposed=False,
     ):
+        """Computes attention.
+
+        `v` has shape `(batch, seq, kv_heads, head_dim)`, or
+        `(batch, kv_heads, head_dim, seq)` when `value_is_transposed`.
+        """
         if self.query_head_dim_normalize:
             query_normalization = 1 / np.sqrt(self.head_dim)
         else:
@@ -248,6 +254,8 @@ class CachedGemma3Attention(keras.layers.Layer):
         # decode step wastes most of the kernel on GPU; use einsums there.
         single_query_on_gpu = q.shape[1] == 1 and running_on_gpu()
         if self._use_fused_attention_op() and not single_query_on_gpu:
+            if value_is_transposed:
+                v = ops.transpose(v, (0, 3, 1, 2))
             if attention_mask is not None:
                 attention_mask = ops.expand_dims(attention_mask, axis=1)
                 attention_mask = ops.cast(attention_mask, dtype="bool")
@@ -297,7 +305,10 @@ class CachedGemma3Attention(keras.layers.Layer):
                 attention_softmax, training=training
             )
 
-        results = ops.einsum("bkgts,bskh->btkgh", attention_softmax, v)
+        if value_is_transposed:
+            results = ops.einsum("bkgts,bkhs->btkgh", attention_softmax, v)
+        else:
+            results = ops.einsum("bkgts,bskh->btkgh", attention_softmax, v)
         return ops.reshape(results, (b, q_len, self.num_query_heads, h))
 
     def _compute_bidirectional_sliding_mask(self, batch_size, sequence_length):
@@ -419,32 +430,37 @@ class CachedGemma3Attention(keras.layers.Layer):
             # for the prompt. The shape of `cache_update_mask` is
             # `(bsz, seq_len)`, where `seq_len` is 1 when we are generating
             # token-by-token.
-            start = [0, cache_update_index, 0, 0]
+            #
+            # Values are cached as `(batch, kv_heads, head_dim, seq)`, so the
+            # attention-weighted sum over `seq` contracts the minor dimension
+            # of the cache. With a sequence-major value cache, XLA transposes
+            # and copies the whole cache at every decoding step.
+            value_update = ops.transpose(value_update, (0, 2, 3, 1))
+            key_start = [0, cache_update_index, 0, 0]
+            value_start = [0, 0, 0, cache_update_index]
             if cache_update_mask is not None:
-                cache_update_mask = ops.expand_dims(
-                    ops.expand_dims(cache_update_mask, axis=-1),
-                    axis=-1,
-                )
+                key_update_mask = cache_update_mask[:, :, None, None]
+                value_update_mask = cache_update_mask[:, None, None, :]
                 key_original = ops.slice(
-                    key_cache, start, ops.shape(key_update)
+                    key_cache, key_start, ops.shape(key_update)
                 )
                 value_original = ops.slice(
-                    value_cache, start, ops.shape(value_update)
+                    value_cache, value_start, ops.shape(value_update)
                 )
 
                 key_update = ops.where(
-                    cache_update_mask,
+                    key_update_mask,
                     key_update,
                     key_original,
                 )
                 value_update = ops.where(
-                    cache_update_mask,
+                    value_update_mask,
                     value_update,
                     value_original,
                 )
 
-            key = ops.slice_update(key_cache, start, key_update)
-            value = ops.slice_update(value_cache, start, value_update)
+            key = ops.slice_update(key_cache, key_start, key_update)
+            value = ops.slice_update(value_cache, value_start, value_update)
             cache = (key, value)
         else:
             key = self.key_dense(x)
@@ -462,6 +478,7 @@ class CachedGemma3Attention(keras.layers.Layer):
             attention_mask,
             training=training,
             cache_update_index=cache_update_index,
+            value_is_transposed=cache is not None,
         )
 
         # Wipe attn vec if there are no attended tokens.
