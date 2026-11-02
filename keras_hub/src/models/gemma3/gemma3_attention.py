@@ -244,7 +244,10 @@ class CachedGemma3Attention(keras.layers.Layer):
                 cache_update_index=cache_update_index,
             )
 
-        if self._use_fused_attention_op():
+        # Flash attention kernels tile over query positions, so a single-token
+        # decode step wastes most of the kernel on GPU; use einsums there.
+        single_query_on_gpu = q.shape[1] == 1 and running_on_gpu()
+        if self._use_fused_attention_op() and not single_query_on_gpu:
             if attention_mask is not None:
                 attention_mask = ops.expand_dims(attention_mask, axis=1)
                 attention_mask = ops.cast(attention_mask, dtype="bool")
