@@ -249,6 +249,7 @@ class Gemma3DecoderBlock(keras.layers.Layer):
         cache=None,
         cache_update_index=0,
         cache_update_mask=None,
+        query_kernel=None,
     ):
         # Note: `vision_mask` is used only for Gemma3.
         # If float16, we clamp the input to avoid overflow.
@@ -267,6 +268,7 @@ class Gemma3DecoderBlock(keras.layers.Layer):
                 cache=cache,
                 cache_update_index=cache_update_index,
                 cache_update_mask=cache_update_mask,
+                query_kernel=query_kernel,
             )
         else:
             attention = self.attention(

@@ -391,7 +391,13 @@ class CachedGemma3Attention(keras.layers.Layer):
         cache_update_index=0,
         cache_update_mask=None,
         training=False,
+        query_kernel=None,
     ):
+        """Forward pass.
+
+        `query_kernel` optionally replaces the query projection's kernel with
+        the same weights from `transposed_query_kernel()`.
+        """
         # Route to vLLM paged attention while serving on TPU; otherwise the
         # original dense path below runs unchanged.
         vllm_context = get_vllm_context()
@@ -401,7 +407,10 @@ class CachedGemma3Attention(keras.layers.Layer):
         ):
             return self._compute_vllm_attention(x, cache, vllm_context)
 
-        query = self.query_dense(x)
+        if query_kernel is None:
+            query = self.query_dense(x)
+        else:
+            query = ops.einsum("btd,dnh->btnh", x, query_kernel)
 
         if self.use_query_key_norm:
             query = self.query_norm(query)
@@ -494,6 +503,18 @@ class CachedGemma3Attention(keras.layers.Layer):
         if cache is not None:
             return attention_output, cache
         return attention_output
+
+    def transposed_query_kernel(self):
+        """The query kernel as `(hidden_dim, num_query_heads, head_dim)`.
+
+        This is the layout the query matmul uses, which callers can prepare
+        once and pass to `call()` as `query_kernel`. Returns `None` when the
+        query projection is quantized.
+        """
+        if getattr(self.query_dense, "quantization_mode", None):
+            return None
+        kernel = ops.cast(self.query_dense.kernel, self.compute_dtype)
+        return ops.transpose(kernel, (1, 0, 2))
 
     def compute_output_shape(self, input_shape):
         return input_shape

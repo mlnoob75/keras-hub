@@ -138,6 +138,7 @@ class Gemma3CausalLM(CausalLM):
         padding_mask=None,
         vision_indices=None,
         cache_update_mask=None,
+        query_kernels=None,
     ):
         """Forward pass of `Gemma3CausalLM` with cache.
 
@@ -160,6 +161,8 @@ class Gemma3CausalLM(CausalLM):
                 `(batch_size, image_sequence_length, hidden_dim)`.
             padding_mask: a dense int Tensor with shape
                 `(batch_size, max_length)`.
+            query_kernels: optional tuple with one entry per transformer
+                layer, from `_query_kernels_for_generation()`.
 
         Returns:
             A (logits, hidden_states, cache) tuple. Where `logits` is the
@@ -198,6 +201,9 @@ class Gemma3CausalLM(CausalLM):
                 padding_mask=padding_mask,
                 vision_mask=vision_mask,
                 cache_update_mask=cache_update_mask,
+                query_kernel=(
+                    None if query_kernels is None else query_kernels[i]
+                ),
             )
             caches.append(next_cache)
         cache = tuple(caches)
@@ -212,6 +218,7 @@ class Gemma3CausalLM(CausalLM):
         vision_mask,
         padding_mask,
         vision_indices,
+        query_kernels=None,
     ):
         """Build an empty cache for use with `call_with_cache()`."""
         batch_size = ops.shape(token_ids)[0]
@@ -237,7 +244,7 @@ class Gemma3CausalLM(CausalLM):
         chunk_size = self._prefill_chunk_size(token_ids)
         if img_embeddings is None and chunk_size is not None:
             return self._prefill_in_chunks(
-                token_ids, padding_mask, cache, chunk_size
+                token_ids, padding_mask, cache, chunk_size, query_kernels
             )
         logits, hidden_states, cache = self.call_with_cache(
             token_ids=token_ids,
@@ -248,6 +255,7 @@ class Gemma3CausalLM(CausalLM):
             padding_mask=padding_mask,
             vision_indices=vision_indices,
             cache_update_mask=None,
+            query_kernels=query_kernels,
         )
         return hidden_states, cache
 
@@ -264,7 +272,9 @@ class Gemma3CausalLM(CausalLM):
         chunk_size = max(64, PREFILL_CHUNK_TOKENS // batch_size)
         return chunk_size if chunk_size < max_length else None
 
-    def _prefill_in_chunks(self, token_ids, padding_mask, cache, chunk_size):
+    def _prefill_in_chunks(
+        self, token_ids, padding_mask, cache, chunk_size, query_kernels=None
+    ):
         """Seed the cache in fixed-size chunks, up to the longest prompt.
 
         Inputs are padded to the full generation length, so a single-pass
@@ -297,6 +307,7 @@ class Gemma3CausalLM(CausalLM):
                 token_ids=chunk,
                 cache=cache,
                 cache_update_index=start,
+                query_kernels=query_kernels,
             )
             hidden_states = ops.slice_update(
                 hidden_states, [0, start, 0], chunk_hidden_states
@@ -308,6 +319,19 @@ class Gemma3CausalLM(CausalLM):
             cond, body, (i, hidden_states, cache)
         )
         return hidden_states, cache
+
+    def _query_kernels_for_generation(self):
+        """Query kernels laid out for the query matmul, one per layer.
+
+        The stored layout needs a transpose before the matmul. Done inside
+        the prefill and decoding loops, it is repeated at every iteration
+        (XLA does not hoist transposes of loop-invariant weights), so it is
+        done once here instead.
+        """
+        return tuple(
+            layer.attention.transposed_query_kernel()
+            for layer in self.backbone.transformer_layers
+        )
 
     def generate_step(self, inputs, stop_token_ids=[106]):
         """A compilable generation function for a single batch of inputs.
@@ -361,6 +385,8 @@ class Gemma3CausalLM(CausalLM):
             vision_mask = None
             vision_indices = None
 
+        query_kernels = self._query_kernels_for_generation()
+
         # Create and seed cache with a single forward pass.
         hidden_states, cache = self._build_cache(
             token_ids,
@@ -368,6 +394,7 @@ class Gemma3CausalLM(CausalLM):
             vision_mask,
             padding_mask,
             vision_indices,
+            query_kernels,
         )
 
         # Compute the lengths of all user inputted tokens ids.
@@ -388,6 +415,7 @@ class Gemma3CausalLM(CausalLM):
                 cache=cache,
                 cache_update_index=cache_update_index,
                 cache_update_mask=sliced_cache_update_mask,
+                query_kernels=query_kernels,
             )
             return (
                 ops.squeeze(logits, axis=1),

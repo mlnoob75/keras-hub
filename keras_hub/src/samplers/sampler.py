@@ -105,11 +105,9 @@ class Sampler:
             return ops.logical_not(ops.all(prompt_done))
 
         def body(prompt, cache, index, mask):
-            # Compute the softmax distribution for the next token.
             logits, _, cache = next(prompt, cache, index)
-            probabilities = self.compute_probabilities(logits)
             # Compute the next token.
-            next_token = self.get_next_token(probabilities)
+            next_token = self._get_next_token_from_logits(logits)
             # Don't overwrite anywhere mask is True.
             next_token = ops.cast(next_token, prompt.dtype)
             next_token = ops.where(mask[:, index], prompt[:, index], next_token)
@@ -137,6 +135,15 @@ class Sampler:
         """
         logits = ops.cast(logits, "float32")
         return keras.activations.softmax(logits / self.temperature)
+
+    def _get_next_token_from_logits(self, logits):
+        """Computes the next token from the logits.
+
+        Computes the softmax distribution with `compute_probabilities()`,
+        then picks the token with `get_next_token()`.
+        """
+        probabilities = self.compute_probabilities(logits)
+        return self.get_next_token(probabilities)
 
     def run_loop(
         self, cond, body, model=None, loop_vars=None, maximum_iterations=None
