@@ -9,7 +9,14 @@ from keras_hub.src.layers.modeling.transformer_layer_utils import (
     merge_padding_and_attention_mask,
 )
 from keras_hub.src.models.gemma3.gemma3_attention import CachedGemma3Attention
+from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
+    can_use_gated_projection,
+)
+from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
+    gated_projection,
+)
 from keras_hub.src.models.gemma3.gemma3_layers import RMSNormalization
+from keras_hub.src.utils.keras_utils import running_on_gpu
 
 
 class Gemma3DecoderBlock(keras.layers.Layer):
@@ -303,9 +310,21 @@ class Gemma3DecoderBlock(keras.layers.Layer):
 
         normalized_x = self.pre_ffw_norm(attention_x)
 
-        x1 = self.gating_ffw(normalized_x)
-        x2 = self.gating_ffw_2(normalized_x)
-        x = keras.activations.gelu(x1, approximate=True) * x2
+        if cache is not None and self._use_gated_projection(
+            normalized_x
+        ):
+            batch_size, seq_length, hidden_dim = normalized_x.shape
+            dtype = normalized_x.dtype
+            x = gated_projection(
+                ops.reshape(normalized_x, (-1, hidden_dim)),
+                ops.cast(self.gating_ffw.kernel, dtype),
+                ops.cast(self.gating_ffw_2.kernel, dtype),
+            )
+            x = ops.reshape(x, (batch_size, seq_length, -1))
+        else:
+            x1 = self.gating_ffw(normalized_x)
+            x2 = self.gating_ffw_2(normalized_x)
+            x = keras.activations.gelu(x1, approximate=True) * x2
         x = self.ffw_linear(x)
 
         if self.use_post_ffw_norm:
@@ -323,6 +342,27 @@ class Gemma3DecoderBlock(keras.layers.Layer):
         if cache is not None:
             return x, new_cache
         return x
+
+    def _use_gated_projection(self, x):
+        """Whether to run the gated projection with the Pallas kernel.
+
+        Only for generation with a cache (no gradients), on a GPU with the
+        JAX backend.
+        """
+        if keras.config.backend() != "jax" or not running_on_gpu():
+            return False
+        layers = (self.gating_ffw, self.gating_ffw_2)
+        if any(getattr(layer, "quantization_mode", None) for layer in layers):
+            return False
+        batch_size, seq_length = x.shape[0], x.shape[1]
+        if batch_size is None or seq_length is None:
+            return False
+        return can_use_gated_projection(
+            batch_size * seq_length,
+            self.hidden_dim,
+            self.intermediate_dim // self.gate_dim_reduction,
+            keras.backend.standardize_dtype(x.dtype),
+        )
 
     def get_config(self):
         config = super().get_config()

@@ -1,7 +1,8 @@
-"""Pallas GPU kernels for Gemma3 attention during generation.
+"""Pallas GPU kernels for Gemma3 during generation.
 
 `decode_attention_block()` handles single-token decoding;
-`prefill_attention()` handles the chunks of a chunked prefill.
+`prefill_attention()` handles the chunks of a chunked prefill;
+`gated_projection()` computes the first half of the feedforward block.
 
 While decoding one token at a time, XLA runs the attention block as a chain
 of about ten small kernels (query/key normalization, rotary embedding, two
@@ -448,3 +449,108 @@ def prefill_attention(query, key_cache, value_cache, start, window):
     )
     out = jnp.transpose(out, (0, 2, 1, 3, 4))
     return jnp.reshape(out, (batch_size, num_tokens, num_heads, head_dim))
+
+
+_GATED_BLOCK_COLUMNS = 128
+_GATED_BLOCK_K = 32
+# Row tiles of `gated_projection()` for many rows (prefill chunks).
+_GATED_BLOCK_ROWS = 64
+# Up to this many rows (decoding) are handled as one masked row block.
+MAX_GATED_DECODE_ROWS = 16
+
+
+def can_use_gated_projection(rows, hidden_dim, intermediate_dim, dtype):
+    """Whether `gated_projection()` supports these sizes and dtype."""
+    import jax
+
+    if dtype not in ("bfloat16", "float16") or rows is None:
+        return False
+    if rows > MAX_GATED_DECODE_ROWS and rows % _GATED_BLOCK_ROWS:
+        return False
+    if hidden_dim % _GATED_BLOCK_K or intermediate_dim % _GATED_BLOCK_COLUMNS:
+        return False
+    capability = getattr(jax.devices()[0], "compute_capability", None)
+    return capability is not None and float(capability) >= 8.0
+
+
+def _gated_projection_kernel(x_ref, gate_ref, up_ref, out_ref, *, rows):
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plgpu
+
+    f32 = jnp.float32
+    block_rows = out_ref.shape[0] if rows is None else _BLOCK_ROWS
+    hidden_dim = x_ref.shape[1]
+    row_mask = None
+    if rows is not None:
+        # Fewer rows than the smallest tensor-core dot: mask the rest off.
+        row_mask = (jnp.arange(_BLOCK_ROWS) < rows)[:, None]
+
+    def body(k, acc):
+        gate_acc, up_acc = acc
+        cols = pl.ds(k * _GATED_BLOCK_K, _GATED_BLOCK_K)
+        if row_mask is None:
+            x = x_ref[:, cols]
+        else:
+            x = plgpu.load(
+                x_ref.at[pl.ds(0, block_rows), cols], mask=row_mask, other=0
+            )
+        gate_acc += jnp.dot(x, gate_ref[cols, :], preferred_element_type=f32)
+        up_acc += jnp.dot(x, up_ref[cols, :], preferred_element_type=f32)
+        return gate_acc, up_acc
+
+    zeros = jnp.zeros((block_rows, _GATED_BLOCK_COLUMNS), f32)
+    gate, up = jax.lax.fori_loop(
+        0, hidden_dim // _GATED_BLOCK_K, body, (zeros, zeros)
+    )
+    # Round the matmul outputs to the activation dtype, as the einsum layers
+    # do, then apply the gating in float32.
+    dtype = out_ref.dtype
+    gate = gate.astype(dtype).astype(f32)
+    up = up.astype(dtype).astype(f32)
+    out = (jax.nn.gelu(gate, approximate=True) * up).astype(dtype)
+    if row_mask is None:
+        out_ref[...] = out
+    else:
+        plgpu.store(out_ref.at[pl.ds(0, block_rows), :], out, mask=row_mask)
+
+
+def gated_projection(x, gate_kernel, up_kernel):
+    """Computes `gelu(x @ gate_kernel) * (x @ up_kernel)` in one kernel.
+
+    Both matmuls share their input loads, and the gating is applied before
+    anything is written, so the two matmul outputs never go to memory.
+
+    Args:
+        x: `(rows, hidden_dim)`: at most `MAX_GATED_DECODE_ROWS` rows, or a
+            multiple of `_GATED_BLOCK_ROWS`.
+        gate_kernel: `(hidden_dim, intermediate_dim)`.
+        up_kernel: `(hidden_dim, intermediate_dim)`.
+
+    Returns:
+        `(rows, intermediate_dim)`.
+    """
+    import jax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plgpu
+
+    rows, hidden_dim = x.shape
+    intermediate_dim = gate_kernel.shape[1]
+    columns = _GATED_BLOCK_COLUMNS
+    if rows <= MAX_GATED_DECODE_ROWS:
+        block_rows, masked_rows = rows, rows
+    else:
+        block_rows, masked_rows = _GATED_BLOCK_ROWS, None
+    return pl.pallas_call(
+        functools.partial(_gated_projection_kernel, rows=masked_rows),
+        grid=(rows // block_rows, intermediate_dim // columns),
+        in_specs=[
+            pl.BlockSpec((block_rows, hidden_dim), lambda i, j: (i, 0)),
+            pl.BlockSpec((hidden_dim, columns), lambda i, j: (0, j)),
+            pl.BlockSpec((hidden_dim, columns), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((block_rows, columns), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((rows, intermediate_dim), x.dtype),
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3),
+    )(x, gate_kernel, up_kernel)
