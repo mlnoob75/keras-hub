@@ -9,8 +9,9 @@ from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
 )
 from keras_hub.src.utils.tensor_utils import any_equal
 
-# Target number of tokens (across the batch) per chunk of a chunked prefill.
-PREFILL_CHUNK_TOKENS = 2048
+# Target number of tokens (across the batch) per big chunk of a chunked
+# prefill; small chunks hold a quarter of that.
+PREFILL_CHUNK_TOKENS = 4096
 
 try:
     import tensorflow as tf
@@ -241,10 +242,10 @@ class Gemma3CausalLM(CausalLM):
             for _ in range(num_layers)
         )
         # Seed the cache.
-        chunk_size = self._prefill_chunk_size(token_ids)
-        if img_embeddings is None and chunk_size is not None:
+        chunk_sizes = self._prefill_chunk_sizes(token_ids)
+        if img_embeddings is None and chunk_sizes is not None:
             return self._prefill_in_chunks(
-                token_ids, padding_mask, cache, chunk_size, query_kernels
+                token_ids, padding_mask, cache, chunk_sizes, query_kernels
             )
         logits, hidden_states, cache = self.call_with_cache(
             token_ids=token_ids,
@@ -259,28 +260,33 @@ class Gemma3CausalLM(CausalLM):
         )
         return hidden_states, cache
 
-    def _prefill_chunk_size(self, token_ids):
-        """Chunk length for `_prefill_in_chunks`, or `None` for one pass.
+    def _prefill_chunk_sizes(self, token_ids):
+        """Big and small chunk lengths for `_prefill_in_chunks`, or `None`.
 
-        Chunks hold about `PREFILL_CHUNK_TOKENS` tokens across the batch, so
-        each chunk is still a large matmul. Small batches and short sequences
-        fit in one chunk and keep the single-pass prefill.
+        Big chunks hold about `PREFILL_CHUNK_TOKENS` tokens across the batch,
+        so they are large matmuls. Small chunks, a quarter of that, cover the
+        rest of the prompts with less padding. When a small chunk spans the
+        whole sequence (small batches, short sequences), the single-pass
+        prefill is used.
         """
         batch_size, max_length = token_ids.shape
         if batch_size is None or max_length is None:
             return None
-        chunk_size = max(64, PREFILL_CHUNK_TOKENS // batch_size)
-        return chunk_size if chunk_size < max_length else None
+        small = max(16, PREFILL_CHUNK_TOKENS // 4 // batch_size)
+        if small >= max_length:
+            return None
+        big = max(small, PREFILL_CHUNK_TOKENS // batch_size)
+        return big, small
 
     def _prefill_in_chunks(
-        self, token_ids, padding_mask, cache, chunk_size, query_kernels=None
+        self, token_ids, padding_mask, cache, chunk_sizes, query_kernels=None
     ):
         """Seed the cache in fixed-size chunks, up to the longest prompt.
 
         Inputs are padded to the full generation length, so a single-pass
         prefill also runs the model over every position that generation will
-        later fill. Here a loop with a data-dependent trip count stops at the
-        end of the longest prompt.
+        later fill. Here loops with data-dependent trip counts stop at the
+        end of the longest prompt: big chunks first, then small ones.
 
         Prompts are right-padded, so the causal mask alone keeps every prompt
         token from attending to padding. Positions past a prompt get
@@ -288,37 +294,52 @@ class Gemma3CausalLM(CausalLM):
         attended to.
         """
         batch_size, max_length = token_ids.shape
+        big_size, small_size = chunk_sizes
         row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
-        num_chunks = (ops.max(row_lengths) + chunk_size - 1) // chunk_size
+        prompt_length = ops.max(row_lengths)
         hidden_states = ops.zeros(
             (batch_size, max_length, self.backbone.hidden_dim),
             dtype=self.compute_dtype,
         )
 
-        def cond(i, hidden_states, cache):
-            return i < num_chunks
+        def run_chunks(first, num_chunks, size, hidden_states, cache):
+            def cond(i, hidden_states, cache):
+                return i < num_chunks
 
-        def body(i, hidden_states, cache):
-            # Keep the last chunk inside the sequence. It may then recompute
-            # some positions, which writes the same cache values again.
-            start = ops.minimum(i * chunk_size, max_length - chunk_size)
-            chunk = ops.slice(token_ids, [0, start], [batch_size, chunk_size])
-            _, chunk_hidden_states, cache = self.call_with_cache(
-                token_ids=chunk,
-                cache=cache,
-                cache_update_index=start,
-                query_kernels=query_kernels,
-            )
-            hidden_states = ops.slice_update(
-                hidden_states, [0, start, 0], chunk_hidden_states
-            )
-            return i + 1, hidden_states, cache
+            def body(i, hidden_states, cache):
+                # Keep the last chunk inside the sequence. It may then
+                # recompute some positions, which writes the same cache
+                # values again.
+                start = ops.minimum(first + i * size, max_length - size)
+                chunk = ops.slice(token_ids, [0, start], [batch_size, size])
+                _, chunk_hidden_states, cache = self.call_with_cache(
+                    token_ids=chunk,
+                    cache=cache,
+                    cache_update_index=start,
+                    query_kernels=query_kernels,
+                )
+                hidden_states = ops.slice_update(
+                    hidden_states, [0, start, 0], chunk_hidden_states
+                )
+                return i + 1, hidden_states, cache
 
-        i = ops.convert_to_tensor(0, "int32")
-        _, hidden_states, cache = ops.while_loop(
-            cond, body, (i, hidden_states, cache)
+            i = ops.convert_to_tensor(0, "int32")
+            _, hidden_states, cache = ops.while_loop(
+                cond, body, (i, hidden_states, cache)
+            )
+            return hidden_states, cache
+
+        first_small = ops.zeros_like(prompt_length)
+        if small_size < big_size <= max_length:
+            num_big = prompt_length // big_size
+            hidden_states, cache = run_chunks(
+                first_small, num_big, big_size, hidden_states, cache
+            )
+            first_small = num_big * big_size
+        num_small = (prompt_length - first_small + small_size - 1) // small_size
+        return run_chunks(
+            first_small, num_small, small_size, hidden_states, cache
         )
-        return hidden_states, cache
 
     def _query_kernels_for_generation(self):
         """Query kernels laid out for the query matmul, one per layer.

@@ -9,7 +9,13 @@ from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
     can_use_decode_attention_kernel,
 )
 from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
+    can_use_prefill_attention_kernel,
+)
+from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
     decode_attention_block,
+)
+from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
+    prefill_attention,
 )
 from keras_hub.src.models.gemma3.gemma3_layers import RMSNormalization
 from keras_hub.src.utils.keras_utils import clone_initializer
@@ -496,23 +502,35 @@ class CachedGemma3Attention(keras.layers.Layer):
             key = self._apply_rope(key, cache_update_index)
             value = self.value_dense(x)
 
-        attention_vec = self._compute_attention(
-            query,
-            key,
-            value,
-            attention_mask,
-            training=training,
-            cache_update_index=cache_update_index,
-            value_is_transposed=cache is not None,
-        )
+        if (
+            cache is not None
+            and attention_mask_is_causal
+            and self._use_prefill_attention_kernel(query)
+        ):
+            # Every token attends at least to itself: nothing to wipe.
+            attention_vec = self._compute_prefill_attention(
+                query, key, value, cache_update_index
+            )
+        else:
+            attention_vec = self._compute_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                training=training,
+                cache_update_index=cache_update_index,
+                value_is_transposed=cache is not None,
+            )
 
-        # Wipe attn vec if there are no attended tokens.
-        no_attended_tokens = ops.all(
-            ops.equal(attention_mask, 0), axis=-1, keepdims=True
-        )[..., None]
-        attention_vec = ops.where(
-            no_attended_tokens, ops.zeros_like(attention_vec), attention_vec
-        )
+            # Wipe attn vec if there are no attended tokens.
+            no_attended_tokens = ops.all(
+                ops.equal(attention_mask, 0), axis=-1, keepdims=True
+            )[..., None]
+            attention_vec = ops.where(
+                no_attended_tokens,
+                ops.zeros_like(attention_vec),
+                attention_vec,
+            )
 
         attention_output = self.output_dense(attention_vec)
 
@@ -540,6 +558,42 @@ class CachedGemma3Attention(keras.layers.Layer):
             self.num_key_value_heads,
             self.head_dim,
             keras.backend.standardize_dtype(self.compute_dtype),
+        )
+
+    def _use_prefill_attention_kernel(self, query):
+        """Whether to use the Pallas kernel for a multi-token cached call."""
+        if keras.config.backend() != "jax" or not running_on_gpu():
+            return False
+        if query.shape[1] == 1 or self.logit_soft_cap is not None:
+            return False
+        if self.dropout > 0.0 or self.use_bidirectional_attention:
+            return False
+        return can_use_prefill_attention_kernel(
+            query.shape[1],
+            self.num_query_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            keras.backend.standardize_dtype(query.dtype),
+        )
+
+    def _compute_prefill_attention(self, query, key, value, cache_update_index):
+        """Causal attention of a chunk of tokens with the Pallas kernel.
+
+        `key` and `value` are the updated caches; the chunk's first token is
+        at `cache_update_index`.
+        """
+        if self.query_head_dim_normalize:
+            query_normalization = 1 / np.sqrt(self.head_dim)
+        else:
+            query_normalization = 1 / np.sqrt(
+                self.hidden_dim // self.num_query_heads
+            )
+        query *= ops.cast(query_normalization, dtype=query.dtype)
+        window = (
+            self.sliding_window_size if self.use_sliding_window_attention else 0
+        )
+        return prefill_attention(
+            query, key, value, ops.cast(cache_update_index, "int32"), window
         )
 
     def _decode_with_kernel(
@@ -573,12 +627,22 @@ class CachedGemma3Attention(keras.layers.Layer):
             update = ops.ones((batch_size,), dtype="bool")
         else:
             update = ops.reshape(cache_update_mask, (batch_size,))
+        query, key, value = query[:, 0], key[:, 0], value[:, 0]
+        key_offset = value_offset = 0
+        if x.shape[0] != 1:
+            # XLA computes the three projections as one matmul. Passing its
+            # output whole avoids slicing it into three arrays. (With a single
+            # row XLA lowers the projections to reductions instead, and
+            # concatenating them is slower.)
+            query = key = value = ops.concatenate([query, key, value], axis=1)
+            key_offset = self.num_query_heads
+            value_offset = key_offset + self.num_key_value_heads
         attention_vec, key_cache, value_cache = decode_attention_block(
-            query[:, 0],
-            key[:, 0],
-            value[:, 0],
-            1 + ops.cast(self.query_norm.scale, "float32"),
-            1 + ops.cast(self.key_norm.scale, "float32"),
+            query,
+            key,
+            value,
+            ops.convert_to_tensor(self.query_norm.scale),
+            ops.convert_to_tensor(self.key_norm.scale),
             ops.reshape(cos, (self.head_dim,)),
             ops.reshape(sin, (self.head_dim,)),
             key_cache,
@@ -588,6 +652,9 @@ class CachedGemma3Attention(keras.layers.Layer):
             update,
             float(query_normalization),
             self.query_norm.epsilon,
+            self.num_query_heads,
+            key_offset=key_offset,
+            value_offset=value_offset,
         )
         attention_output = self.output_dense(attention_vec[:, None])
         return attention_output, (key_cache, value_cache)

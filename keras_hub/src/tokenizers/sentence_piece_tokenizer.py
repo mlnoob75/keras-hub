@@ -1,5 +1,7 @@
 import base64
 import binascii
+import functools
+import inspect
 import os
 
 import keras
@@ -26,6 +28,27 @@ except ImportError:
     spm = None
 
 VOCAB_FILENAME = "vocabulary.spm"
+
+
+# Most threads used for a batched SentencePiece call. By default
+# SentencePiece uses one thread per hardware thread, and on hosts with many
+# cores starting them costs more than encoding a batch of prompts.
+_MAX_SPM_THREADS = 8
+
+
+def _spm_thread_kwargs(batch):
+    """`num_threads` for a batched SentencePiece `Encode`/`Decode` call.
+
+    Empty for SentencePiece versions without the argument (before 0.1.99).
+    """
+    if "num_threads" not in _spm_encode_args():
+        return {}
+    return {"num_threads": max(1, min(len(batch), _MAX_SPM_THREADS))}
+
+
+@functools.cache
+def _spm_encode_args():
+    return inspect.signature(spm.SentencePieceProcessor.Encode).parameters
 
 
 @keras_hub_export("keras_hub.tokenizers.SentencePieceTokenizer")
@@ -380,7 +403,10 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
 
         inputs, batched = _canonicalize_tokenize_inputs(inputs)
         batched_tokens = self._sentence_piece_spm.Encode(
-            inputs, add_bos=self.add_bos, add_eos=self.add_eos
+            inputs,
+            add_bos=self.add_bos,
+            add_eos=self.add_eos,
+            **_spm_thread_kwargs(inputs),
         )
 
         # Convert to a dense output if `sequence_length` is set.
@@ -474,7 +500,9 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
     def _detokenize_spm(self, inputs):
         self._maybe_initialized_spm()
         inputs, batched = self._canonicalize_detokenize_spm_inputs(inputs)
-        outputs = self._sentence_piece_spm.Decode(inputs)
+        outputs = self._sentence_piece_spm.Decode(
+            inputs, **_spm_thread_kwargs(inputs)
+        )
         if not batched:
             outputs = outputs[0]
         return outputs

@@ -1,4 +1,7 @@
-"""Pallas GPU kernel for the Gemma3 attention block during decoding.
+"""Pallas GPU kernels for Gemma3 attention during generation.
+
+`decode_attention_block()` handles single-token decoding;
+`prefill_attention()` handles the chunks of a chunked prefill.
 
 While decoding one token at a time, XLA runs the attention block as a chain
 of about ten small kernels (query/key normalization, rotary embedding, two
@@ -11,6 +14,10 @@ only.
 
 JAX on GPU only. Callers check `can_use_decode_attention_kernel()` first.
 """
+
+# Query rows (tokens times query heads per key/value head) per program of
+# the prefill kernel.
+_PREFILL_BLOCK_ROWS = 32
 
 import functools
 
@@ -67,6 +74,8 @@ def _decode_attention_block_kernel(
     new_value_cache_ref,
     *,
     groups,
+    key_offset,
+    value_offset,
     seq_len,
     query_normalization,
     epsilon,
@@ -92,8 +101,9 @@ def _decode_attention_block_kernel(
 
     cos1, cos2 = halves(cos_ref)
     sin1, sin2 = halves(sin_ref)
-    query_scale1, query_scale2 = halves(query_scale_ref)
-    key_scale1, key_scale2 = halves(key_scale_ref)
+    # The norms multiply by `1 + scale`.
+    query_scale1, query_scale2 = (1 + x for x in halves(query_scale_ref))
+    key_scale1, key_scale2 = (1 + x for x in halves(key_scale_ref))
 
     def rotate(x1, x2):
         # Rotary embedding (`x * cos + rotate_half(x) * sin`) on halves,
@@ -124,8 +134,8 @@ def _decode_attention_block_kernel(
     )
 
     key1, key2 = _rms_norm(
-        key_ref[batch, kv_head, lo].astype(f32)[None, :],
-        key_ref[batch, kv_head, hi].astype(f32)[None, :],
+        key_ref[batch, key_offset + kv_head, lo].astype(f32)[None, :],
+        key_ref[batch, key_offset + kv_head, hi].astype(f32)[None, :],
         key_scale1[None, :],
         key_scale2[None, :],
         head_dim,
@@ -134,7 +144,7 @@ def _decode_attention_block_kernel(
     key1, key2 = rotate(key1[0], key2[0])
     key1 = key1.astype(dtype)
     key2 = key2.astype(dtype)
-    value = value_ref[batch, kv_head, :]
+    value = value_ref[batch, value_offset + kv_head, :]
 
     def body(block, carry):
         row_max, row_sum, acc = carry
@@ -222,16 +232,23 @@ def decode_attention_block(
     update,
     query_normalization,
     epsilon,
+    num_heads,
+    key_offset=0,
+    value_offset=0,
 ):
     """Single-token attention block with an in-place cache update.
 
     Args:
-        query: `(batch, num_query_heads, head_dim)` projected query.
-        key: `(batch, num_key_value_heads, head_dim)` projected key.
-        value: `(batch, num_key_value_heads, head_dim)` projected value.
-        query_scale: `(head_dim,)` float32 query norm multiplier
-            (`1 + scale`).
-        key_scale: `(head_dim,)` float32 key norm multiplier.
+        query: `(batch, rows, head_dim)` whose first `num_query_heads` rows
+            are the projected query.
+        key: `(batch, rows, head_dim)` whose rows from `key_offset` are the
+            `num_key_value_heads` projected keys.
+        value: `(batch, rows, head_dim)` whose rows from `value_offset` are
+            the projected values. `query`, `key` and `value` can be the same
+            concatenated array.
+        query_scale: `(head_dim,)` query norm scale (the norm multiplies by
+            `1 + query_scale`).
+        key_scale: `(head_dim,)` key norm scale.
         cos: `(head_dim,)` rotary embedding cosines at `index`.
         sin: `(head_dim,)` rotary embedding sines at `index`.
         key_cache: `(batch, seq, num_key_value_heads, head_dim)`.
@@ -242,6 +259,9 @@ def decode_attention_block(
             value into the cache.
         query_normalization: float, query scaling before the dot product.
         epsilon: float, epsilon of the query and key norms.
+        num_heads: int, the number of query heads.
+        key_offset: int, first key row in `key`.
+        value_offset: int, first value row in `value`.
 
     Returns:
         A tuple of the `(batch, num_query_heads, head_dim)` attention output
@@ -252,12 +272,14 @@ def decode_attention_block(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
 
-    batch_size, num_heads, head_dim = query.shape
+    batch_size, _, head_dim = query.shape
     seq_len, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
     bounds = jnp.stack([start, index]).astype("int32")
     kernel = functools.partial(
         _decode_attention_block_kernel,
         groups=num_heads // num_kv_heads,
+        key_offset=key_offset,
+        value_offset=value_offset,
         seq_len=seq_len,
         query_normalization=query_normalization,
         epsilon=epsilon,
@@ -266,7 +288,9 @@ def decode_attention_block(
         kernel,
         grid=(batch_size, num_kv_heads),
         out_shape=[
-            jax.ShapeDtypeStruct(query.shape, query.dtype),
+            jax.ShapeDtypeStruct(
+                (batch_size, num_heads, head_dim), query.dtype
+            ),
             jax.ShapeDtypeStruct(key_cache.shape, key_cache.dtype),
             jax.ShapeDtypeStruct(value_cache.shape, value_cache.dtype),
         ],
@@ -278,10 +302,149 @@ def decode_attention_block(
         query,
         key,
         value,
-        query_scale.astype("float32"),
-        key_scale.astype("float32"),
+        query_scale,
+        key_scale,
         cos,
         sin,
         key_cache,
         value_cache,
     )
+
+
+def can_use_prefill_attention_kernel(
+    num_tokens, num_query_heads, num_key_value_heads, head_dim, dtype
+):
+    """Whether `prefill_attention()` supports these sizes and dtype."""
+    if num_tokens is None:
+        return False
+    rows = num_tokens * (num_query_heads // num_key_value_heads)
+    if rows % _PREFILL_BLOCK_ROWS:
+        return False
+    return can_use_decode_attention_kernel(
+        num_query_heads, num_key_value_heads, head_dim, dtype
+    )
+
+
+def _prefill_attention_kernel(
+    start_ref,
+    query_ref,
+    key_cache_ref,
+    value_cache_ref,
+    out_ref,
+    *,
+    groups,
+    seq_len,
+    window,
+):
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plgpu
+
+    f32 = jnp.float32
+    batch = pl.program_id(0)
+    kv_head = pl.program_id(1)
+    first_row = pl.program_id(2) * _PREFILL_BLOCK_ROWS
+    start = start_ref[0]
+    # Rows are (token, query head) pairs; each token sits at `start + t`.
+    rows = first_row + jnp.arange(_PREFILL_BLOCK_ROWS)
+    positions = start + rows // groups
+    query = query_ref[batch, kv_head, pl.ds(first_row, _PREFILL_BLOCK_ROWS)]
+    dtype = query.dtype
+    first_position = start + first_row // groups
+    last_position = start + (first_row + _PREFILL_BLOCK_ROWS - 1) // groups
+    lowest_key = 0
+    if window:
+        lowest_key = jnp.maximum(first_position - window + 1, 0)
+
+    def body(block, carry):
+        row_max, row_sum, acc = carry
+        offset = block * _BLOCK_KEYS
+        keys = offset + jnp.arange(_BLOCK_KEYS)
+        in_cache = keys < seq_len
+        key = plgpu.load(
+            key_cache_ref.at[batch, pl.ds(offset, _BLOCK_KEYS), kv_head, :],
+            mask=in_cache[:, None],
+            other=0,
+        )
+        value = plgpu.load(
+            value_cache_ref.at[batch, kv_head, :, pl.ds(offset, _BLOCK_KEYS)],
+            mask=in_cache[None, :],
+            other=0,
+        )
+        logits = jnp.dot(query, key.T, preferred_element_type=f32)
+        logits = logits.astype(dtype).astype(f32)
+        attended = keys[None, :] <= positions[:, None]
+        if window:
+            attended &= keys[None, :] > positions[:, None] - window
+        logits = jnp.where(attended, logits, -jnp.inf)
+        new_max = jnp.maximum(row_max, jnp.max(logits, axis=1))
+        rescale = jnp.exp(row_max - new_max)
+        probs = jnp.exp(logits - new_max[:, None])
+        row_sum = row_sum * rescale + jnp.sum(probs, axis=1)
+        acc = acc * rescale[:, None] + jnp.dot(
+            probs.astype(dtype), value.T, preferred_element_type=f32
+        )
+        return new_max, row_sum, acc
+
+    head_dim = query.shape[-1]
+    init = (
+        jnp.full((_PREFILL_BLOCK_ROWS,), -jnp.inf, f32),
+        jnp.zeros((_PREFILL_BLOCK_ROWS,), f32),
+        jnp.zeros((_PREFILL_BLOCK_ROWS, head_dim), f32),
+    )
+    _, row_sum, acc = jax.lax.fori_loop(
+        lowest_key // _BLOCK_KEYS, last_position // _BLOCK_KEYS + 1, body, init
+    )
+    out_ref[batch, kv_head, pl.ds(first_row, _PREFILL_BLOCK_ROWS)] = (
+        acc / row_sum[:, None]
+    ).astype(out_ref.dtype)
+
+
+def prefill_attention(query, key_cache, value_cache, start, window):
+    """Causal attention of a chunk of tokens over the updated cache.
+
+    Args:
+        query: `(batch, num_tokens, num_query_heads, head_dim)`, already
+            scaled. Token `t` sits at position `start + t`.
+        key_cache: `(batch, seq, num_key_value_heads, head_dim)`, including
+            the chunk's keys.
+        value_cache: `(batch, num_key_value_heads, head_dim, seq)`, including
+            the chunk's values.
+        start: int scalar, position of the chunk's first token.
+        window: int, sliding window size, or 0 for full attention.
+
+    Returns:
+        `(batch, num_tokens, num_query_heads, head_dim)` attention output.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plgpu
+
+    batch_size, num_tokens, num_heads, head_dim = query.shape
+    seq_len, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
+    groups = num_heads // num_kv_heads
+    rows = num_tokens * groups
+    # Rows of one key/value head: (token, query head) pairs.
+    query = jnp.reshape(
+        query, (batch_size, num_tokens, num_kv_heads, groups, head_dim)
+    )
+    query = jnp.transpose(query, (0, 2, 1, 3, 4))
+    query = jnp.reshape(query, (batch_size, num_kv_heads, rows, head_dim))
+    out = pl.pallas_call(
+        functools.partial(
+            _prefill_attention_kernel,
+            groups=groups,
+            seq_len=seq_len,
+            window=window,
+        ),
+        grid=(batch_size, num_kv_heads, rows // _PREFILL_BLOCK_ROWS),
+        out_shape=jax.ShapeDtypeStruct(query.shape, query.dtype),
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3),
+    )(jnp.reshape(start, (1,)).astype("int32"), query, key_cache, value_cache)
+    out = jnp.reshape(
+        out, (batch_size, num_kv_heads, num_tokens, groups, head_dim)
+    )
+    out = jnp.transpose(out, (0, 2, 1, 3, 4))
+    return jnp.reshape(out, (batch_size, num_tokens, num_heads, head_dim))
