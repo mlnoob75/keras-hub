@@ -14,6 +14,7 @@ from keras_hub.src.models.gemma3.gemma3_tokenizer import Gemma3Tokenizer
 from keras_hub.src.utils.tensor_utils import assert_tf_installed
 from keras_hub.src.utils.tensor_utils import preprocessing_function
 from keras_hub.src.utils.tensor_utils import strip_to_ragged
+from keras_hub.src.utils.tensor_utils import strip_to_ragged_python
 
 try:
     import tensorflow as tf
@@ -828,7 +829,6 @@ class Gemma3CausalLMPreprocessor(CausalLMPreprocessor):
         )
         return config
 
-    @preprocessing_function
     def generate_postprocess(
         self,
         x,
@@ -839,17 +839,34 @@ class Gemma3CausalLMPreprocessor(CausalLMPreprocessor):
         padding and start/end tokens, and then converting the integer sequence
         back to a string.
         """
-        if not self.built:
-            self.build(None)
+        if self._use_tf_workflow():
+            return self._generate_postprocess_tf(x)
+        return self._generate_postprocess_python(x)
 
-        token_ids, padding_mask = x["token_ids"], x["padding_mask"]
+    def _ids_to_strip(self):
         ids_to_strip = self.tokenizer.special_token_ids
-
         # We do not want to strip SoI token because it is provided by the user.
         if self.tokenizer.start_of_image_token_id in ids_to_strip:
             ids_to_strip.remove(self.tokenizer.start_of_image_token_id)
+        return ids_to_strip
 
-        token_ids = strip_to_ragged(token_ids, padding_mask, ids_to_strip)
+    def _generate_postprocess_python(self, x):
+        if not self.built:
+            self.build(None)
+
+        token_ids = strip_to_ragged_python(
+            x["token_ids"], x["padding_mask"], self._ids_to_strip()
+        )
+        return self.tokenizer.detokenize(token_ids)
+
+    @preprocessing_function
+    def _generate_postprocess_tf(self, x):
+        if not self.built:
+            self.build(None)
+
+        token_ids = strip_to_ragged(
+            x["token_ids"], x["padding_mask"], self._ids_to_strip()
+        )
         return self.tokenizer.detokenize(token_ids)
 
     @property

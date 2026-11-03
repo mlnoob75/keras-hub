@@ -6,6 +6,15 @@ from keras_hub.src.utils.tensor_utils import assert_tf_libs_installed
 from keras_hub.src.utils.tensor_utils import in_grain_data_pipeline
 from keras_hub.src.utils.tensor_utils import in_tf_function
 
+_PYTHON_SCALARS = (str, bytes, int, float, bool)
+
+
+def first_leaf(x):
+    """The first leaf of nested lists and tuples, without flattening them."""
+    while isinstance(x, (list, tuple)) and x:
+        x = x[0]
+    return x
+
 
 class PreprocessingLayer(keras.layers.Layer):
     """Preprocessing layer base class."""
@@ -30,6 +39,7 @@ class PreprocessingLayer(keras.layers.Layer):
         self._call_accepts_labels = all(
             k in params for k in ("x", "y", "sample_weight")
         )
+        self._call_accepts_training = "training" in params
         # Most pre-preprocessing has no build.
         if not hasattr(self, "build"):
             self.built = True
@@ -58,7 +68,31 @@ class PreprocessingLayer(keras.layers.Layer):
             # a `StridedSlice` fed a shape as `begin`); on the CPU, none did.
             with keras.device("cpu"):
                 return super().__call__(*args, **kwargs)
+        if self._is_eager_python_call(args):
+            return self.call(*args, **kwargs)
         return super().__call__(*args, **kwargs)
+
+    def _is_eager_python_call(self, args):
+        """Whether this call can skip Keras' `Layer.__call__` machinery.
+
+        For plain Python data (strings, nested lists of tokens) run eagerly
+        on the Python workflow, `Layer.__call__` only checks every leaf for
+        masks and symbolic tensors, which costs tens of milliseconds for a
+        batch of long token lists. Skipped only for a built layer, whose
+        `call` does not take `training`, when the first leaf of every
+        positional argument (or of each element of a tuple argument) is a
+        Python scalar.
+        """
+        if not self.built or self._call_accepts_training:
+            return False
+        if not self._allow_python_workflow or in_tf_function():
+            return False
+        for arg in args:
+            parts = arg if isinstance(arg, tuple) else (arg,)
+            for part in parts:
+                if not isinstance(first_leaf(part), _PYTHON_SCALARS):
+                    return False
+        return bool(args)
 
     def _use_tf_workflow(self):
         """Whether to run the TensorFlow path instead of the pure Python path.

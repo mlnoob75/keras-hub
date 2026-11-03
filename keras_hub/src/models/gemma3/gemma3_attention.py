@@ -5,6 +5,12 @@ import numpy as np
 from keras import ops
 
 from keras_hub.src.layers.modeling.rotary_embedding import RotaryEmbedding
+from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
+    can_use_decode_attention_kernel,
+)
+from keras_hub.src.models.gemma3.gemma3_decode_kernels import (
+    decode_attention_block,
+)
 from keras_hub.src.models.gemma3.gemma3_layers import RMSNormalization
 from keras_hub.src.utils.keras_utils import clone_initializer
 from keras_hub.src.utils.keras_utils import fused_attention_op_available
@@ -392,11 +398,15 @@ class CachedGemma3Attention(keras.layers.Layer):
         cache_update_mask=None,
         training=False,
         query_kernel=None,
+        attention_mask_is_causal=False,
     ):
         """Forward pass.
 
         `query_kernel` optionally replaces the query projection's kernel with
         the same weights from `transposed_query_kernel()`.
+        `attention_mask_is_causal` is set by the caller when `attention_mask`
+        is only the causal (and sliding window) mask, with no padding or
+        image masking, which allows the single-token decoding kernel.
         """
         # Route to vLLM paged attention while serving on TPU; otherwise the
         # original dense path below runs unchanged.
@@ -407,10 +417,16 @@ class CachedGemma3Attention(keras.layers.Layer):
         ):
             return self._compute_vllm_attention(x, cache, vllm_context)
 
-        if query_kernel is None:
-            query = self.query_dense(x)
-        else:
-            query = ops.einsum("btd,dnh->btnh", x, query_kernel)
+        if (
+            cache is not None
+            and attention_mask_is_causal
+            and self._use_decode_attention_kernel(x)
+        ):
+            return self._decode_with_kernel(
+                x, cache, cache_update_index, cache_update_mask, query_kernel
+            )
+
+        query = self._project_query(x, query_kernel)
 
         if self.use_query_key_norm:
             query = self.query_norm(query)
@@ -503,6 +519,78 @@ class CachedGemma3Attention(keras.layers.Layer):
         if cache is not None:
             return attention_output, cache
         return attention_output
+
+    def _project_query(self, x, query_kernel=None):
+        if query_kernel is None:
+            return self.query_dense(x)
+        return ops.einsum("btd,dnh->btnh", x, query_kernel)
+
+    def _use_decode_attention_kernel(self, x):
+        """Whether to use the Pallas kernel for single-token decoding."""
+        if keras.config.backend() != "jax" or not running_on_gpu():
+            return False
+        if x.shape[1] != 1 or not self.use_query_key_norm:
+            return False
+        if self.logit_soft_cap is not None or self.dropout > 0.0:
+            return False
+        if self.use_bidirectional_attention:
+            return False
+        return can_use_decode_attention_kernel(
+            self.num_query_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            keras.backend.standardize_dtype(self.compute_dtype),
+        )
+
+    def _decode_with_kernel(
+        self, x, cache, cache_update_index, cache_update_mask, query_kernel
+    ):
+        """The cached single-token attention block as one Pallas kernel.
+
+        Same as the einsum path with a causal mask: the token at
+        `cache_update_index` attends to the cached keys up to itself (at
+        most `sliding_window_size` of them with sliding window attention).
+        """
+        key_cache, value_cache = cache
+        query = self._project_query(x, query_kernel)
+        key = self.key_dense(x)
+        value = self.value_dense(x)
+        cos, sin = self.rope_layer._compute_cos_sin_embedding(
+            query, start_index=cache_update_index
+        )
+        if self.query_head_dim_normalize:
+            query_normalization = 1 / np.sqrt(self.head_dim)
+        else:
+            query_normalization = 1 / np.sqrt(
+                self.hidden_dim // self.num_query_heads
+            )
+        index = ops.cast(cache_update_index, "int32")
+        start = ops.zeros_like(index)
+        if self.use_sliding_window_attention:
+            start = ops.maximum(start, index - self.sliding_window_size + 1)
+        batch_size = ops.shape(x)[0]
+        if cache_update_mask is None:
+            update = ops.ones((batch_size,), dtype="bool")
+        else:
+            update = ops.reshape(cache_update_mask, (batch_size,))
+        attention_vec, key_cache, value_cache = decode_attention_block(
+            query[:, 0],
+            key[:, 0],
+            value[:, 0],
+            1 + ops.cast(self.query_norm.scale, "float32"),
+            1 + ops.cast(self.key_norm.scale, "float32"),
+            ops.reshape(cos, (self.head_dim,)),
+            ops.reshape(sin, (self.head_dim,)),
+            key_cache,
+            value_cache,
+            start,
+            index,
+            update,
+            float(query_normalization),
+            self.query_norm.epsilon,
+        )
+        attention_output = self.output_dense(attention_vec[:, None])
+        return attention_output, (key_cache, value_cache)
 
     def transposed_query_kernel(self):
         """The query kernel as `(hidden_dim, num_query_heads, head_dim)`.

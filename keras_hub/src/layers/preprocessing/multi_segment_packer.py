@@ -1,10 +1,10 @@
-import keras
 import numpy as np
 
 from keras_hub.src.api_export import keras_hub_export
 from keras_hub.src.layers.preprocessing.preprocessing_layer import (
     PreprocessingLayer,
 )
+from keras_hub.src.layers.preprocessing.preprocessing_layer import first_leaf
 from keras_hub.src.utils.tensor_utils import canonicalize_python_inputs
 from keras_hub.src.utils.tensor_utils import (
     convert_preprocessing_outputs_python,
@@ -542,11 +542,9 @@ class MultiSegmentPacker(PreprocessingLayer):
             segment_ids = segment_ids[0]
 
         def _canonicalize_outputs(outputs, dtype=None):
-            flat_outputs = keras.tree.flatten(outputs)
-            if not flat_outputs:
-                return np.array(outputs, dtype=dtype or "int32")
-            first_element = flat_outputs[0]
-            if not isinstance(first_element, str):
+            # Only the first element's type matters; flattening long token
+            # lists just to read it is slow.
+            if not isinstance(first_leaf(outputs), str):
                 return np.array(outputs, dtype=dtype or "int32")
             else:
                 return outputs

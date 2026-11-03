@@ -1,5 +1,6 @@
 import keras
 from keras import ops
+from keras.src.backend.common.masking import get_keras_mask
 
 from keras_hub.src.layers.modeling.transformer_layer_utils import (
     compute_causal_mask,
@@ -262,6 +263,14 @@ class Gemma3DecoderBlock(keras.layers.Layer):
             normalized_x, padding_mask, vision_mask, cache, cache_update_index
         )
         if cache is not None:
+            # Without padding, image or Keras masks, the attention mask is
+            # only causal (plus the sliding window).
+            attention_mask_is_causal = (
+                padding_mask is None
+                and vision_mask is None
+                and get_keras_mask(normalized_x) is None
+                and not self.use_bidirectional_attention
+            )
             attention, new_cache = self.attention(
                 normalized_x,
                 attention_mask=attention_mask,
@@ -269,6 +278,7 @@ class Gemma3DecoderBlock(keras.layers.Layer):
                 cache_update_index=cache_update_index,
                 cache_update_mask=cache_update_mask,
                 query_kernel=query_kernel,
+                attention_mask_is_causal=attention_mask_is_causal,
             )
         else:
             attention = self.attention(
